@@ -1,6 +1,6 @@
 # Mainline Linux 7.3 for the Samsung Galaxy A01 (a01q)
 
-Target: regular Brazilian Galaxy A01 (SM-A015*, MSM8937/SDM439 family).
+Target: A015*, MSM8937/SDM439 family).
 
 ## Status (milestone 1)
 
