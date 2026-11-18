@@ -1,0 +1,85 @@
+name: Build a01q kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths: ["overlay/**", "*.patch", ".github/workflows/build-a01q.yml"]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: a01q
+
+      - name: Fetch mainline Linux 7.3.1 and apply the a01q changes
+        run: |
+          git clone --depth 1 --branch v7.3.1 https://github.com/gregkh/linux linux
+          cd linux
+          git apply ../a01q/0001-qcom-add-samsung-a01q.patch
+          cp -r ../a01q/overlay/. .
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev \
+            device-tree-compiler lz4 zstd ccache
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-a01q-${{ github.sha }}
+          restore-keys: ccache-a01q-
+
+      - name: Configure
+        working-directory: linux
+        run: |
+          make defconfig a01q.config a01q-touch-wifi.config
+          sh scripts/a01q-trim.sh
+          make olddefconfig
+          # Fail early if an option the board needs to boot was silently dropped
+          # (olddefconfig ignores unknown/unmet symbols without any error).
+          for o in ARCH_QCOM MSM_GCC_8917 PINCTRL_MSM8917 QCOM_CLK_SMD_RPM QCOM_SMD_RPM \
+                   REGULATOR_QCOM_SMD_RPM REGULATOR_QCOM_SPMI SPMI_MSM_PMIC_ARB MMC_SDHCI_MSM \
+                   DRM_SIMPLEDRM FRAMEBUFFER_CONSOLE PSTORE_RAM TOUCHSCREEN_EDT_FT5X06 \
+                   HWSPINLOCK_QCOM QCOM_SMEM; do
+            grep -q "^CONFIG_$o=y" .config || { echo "::error::CONFIG_$o is not =y"; MISSING=1; }
+          done
+          [ -z "$MISSING" ] || exit 1
+
+      - name: Build
+        working-directory: linux
+        run: |
+          set -o pipefail
+          export PATH="/usr/lib/ccache:$PATH"
+          make -j"$(nproc)" Image.gz dtbs modules 2>&1 | tee ../build.log
+          make INSTALL_MOD_PATH=$PWD/out/modules INSTALL_MOD_STRIP=1 modules_install
+
+      - name: Package
+        working-directory: linux
+        run: |
+          mkdir -p out
+          cp arch/arm64/boot/Image.gz out/
+          cp arch/arm64/boot/dts/qcom/msm8937-samsung-a01q.dtb out/
+          cat out/Image.gz out/msm8937-samsung-a01q.dtb > out/Image.gz-dtb
+          cp .config out/config
+          make -s kernelrelease > out/kernelrelease
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a01q-kernel
+          path: linux/out/
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a01q-build-log
+          path: build.log
+          if-no-files-found: ignore
