@@ -89,6 +89,16 @@
 	vdddig-supply = <&pm8953_l5>;
 };
 
+/*
+ * Stock SDM439 layout: wcnss_fw_region at 0x8d600000, 7 MB. Pin it there
+ * instead of using the dynamic allocation of msm8937.dtsi, so the firmware
+ * always runs where the stock firmware expects it.
+ */
 &wcnss_mem {
+	/delete-property/ size;
+	/delete-property/ alignment;
+	/delete-property/ alloc-ranges;
+	reg = <0x0 0x8d600000 0x0 0x700000>;
+
 	status = "okay";
 };
