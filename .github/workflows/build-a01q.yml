@@ -59,16 +59,17 @@ jobs:
         run: |
           set -o pipefail
           export PATH="/usr/lib/ccache:$PATH"
-          make -j"$(nproc)" Image.gz dtbs modules 2>&1 | tee ../build.log
-          make INSTALL_MOD_PATH=$PWD/out/modules INSTALL_MOD_STRIP=1 modules_install
+          # Only Image.gz and our DTB are built (no modules, no other boards): the boot bring-up phase needs just these.
+          make -j"$(nproc)" Image.gz qcom/msm8937-samsung-a01q.dtb 2>&1 | tee ../build.log
 
       - name: Package
         working-directory: linux
         run: |
           mkdir -p out
           cp arch/arm64/boot/Image.gz out/
-          cp arch/arm64/boot/dts/qcom/msm8937-samsung-a01q.dtb out/
-          cat out/Image.gz out/msm8937-samsung-a01q.dtb > out/Image.gz-dtb
+          # DTB the stock Samsung bootloader accepts (stock DTB + our nodes), see the script header
+          python3 scripts/a01q-dtb-merge.py ../a01q/stock/a01q-stock-boot.dtb \
+                  arch/arm64/boot/dts/qcom/msm8937-samsung-a01q.dtb out/boot_dump.img-dtb
           cp .config out/config
           make -s kernelrelease > out/kernelrelease
 
