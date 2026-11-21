@@ -15,9 +15,8 @@ Result = stock DTB (the sdm439 / msm-id 353 one)
 
 Phandles: a pstore log from a real boot showed that our phandle numbers collide with the stock
 ones (e.g. a "gpios" reference of ours resolved to /soc/ad-hoc-bus/fab-bimc, the timer lost its
-interrupt parent, smem lost its memory-region). Our DTB must therefore be built with
-`DTC_FLAGS=-@` so that it carries `__local_fixups__`; the script then renumbers every phandle of
-our nodes: a node that replaces/merges into a stock node takes that stock node's phandle (LK
+interrupt parent, smem lost its memory-region). The script therefore renumbers every phandle of
+our nodes (the reference cells are found from the binding schema, see find_refs()): a node that replaces/merges into a stock node takes that stock node's phandle (LK
 needs it for the DTBO overlay targets, and the stock root `interrupt-parent` keeps working),
 every other node of ours gets a fresh number above the stock ones. The stock root
 `interrupt-parent` (the downstream MPM "wake-gic", no mainline driver) is replaced by ours (the GIC).
@@ -25,7 +24,7 @@ every other node of ours gets a fresh number above the stock ones. The stock roo
 Pure python, no dependencies. Usage:
   a01q-dtb-merge.py STOCK_BOOT_DTB OURS_DTB OUT_DTB
 """
-import struct, sys, copy
+import os, struct, sys, copy
 
 class N:
     def __init__(s, name):
@@ -127,65 +126,125 @@ def stock_counterpart(stock, path):
         if n is None: return None
     return n
 
+# --- phandle reference discovery -------------------------------------------------------------
+# dtc only emits __local_fixups__ for /plugin/ files, so a normal DTB built with -@ carries no
+# list of the cells that hold phandles. We rebuild that list from the binding schema of the
+# properties our DTS uses ("phandle + N argument cells", where N comes from the provider node).
+CELLS_PROP = {
+    'clocks': '#clock-cells', 'assigned-clocks': '#clock-cells', 'assigned-clock-parents': '#clock-cells',
+    'resets': '#reset-cells', 'power-domains': '#power-domain-cells', 'iommus': '#iommu-cells',
+    'dmas': '#dma-cells', 'phys': '#phy-cells', 'hwlocks': '#hwlock-cells', 'mboxes': '#mbox-cells',
+    'io-channels': '#io-channel-cells', 'interconnects': '#interconnect-cells', 'pwms': '#pwm-cells',
+    'interrupts-extended': '#interrupt-cells', 'qcom,smem-states': '#qcom,smem-state-cells',
+    'thermal-sensors': '#thermal-sensor-cells', 'gpios': '#gpio-cells', 'gpio': '#gpio-cells',
+}
+FIXED_CELLS = {'cooling-device': 2, 'qcom,ipc': 2, 'qcom,ipc-1': 2, 'qcom,ipc-2': 2, 'gpio-ranges': 3,
+               'qcom,rpm-msg-ram': 0}
+SINGLE = {'interrupt-parent', 'memory-region', 'next-level-cache', 'phy-handle', 'remote-endpoint',
+          'operating-points-v2', 'required-opps', 'cpu', 'sram', 'syscon', 'trip', 'port', 'sleep-state',
+          'nvmem-cells', 'cpu-idle-states', 'domain-idle-states', 'msi-parent', 'qcom,rpm-msg-ram',
+          'power-domain', 'qcom,smd-edge', 'vdd-supply', 'phandle-prop'}
+# properties that never hold phandles (used only to keep the audit below quiet)
+NOT_PH = {'reg', 'ranges', 'dma-ranges', 'interrupts', 'compatible', 'status', 'phandle', 'linux,phandle',
+          'device_type', 'model', 'label', 'bootargs', 'stdout-path', 'name', 'regulator-name',
+          'gpio-reserved-ranges', 'interrupt-map', 'interrupt-map-mask', 'opp-hz', 'opp-microvolt',
+          'opp-level', 'opp-peak-kBps', 'qcom,smem', 'qcom,local-pid', 'qcom,remote-pid', 'no-map',
+          'size', 'alignment', 'alloc-ranges', 'qcom,client-id', 'cpu-release-addr', 'enable-method',
+          'bits', 'drive-strength', 'cache-level', 'qcom,dload-mode', 'qcom,pmic-id', 'bias-disable', 'bias-pull-up',
+          'bias-pull-down', 'output-high', 'output-low', 'qcom,ipc-id', 'qcom,smd-channels', 'qcom,remote-pid'}
+
+def ref_kind(name):
+    if name in CELLS_PROP: return ('cells', CELLS_PROP[name])
+    if name.endswith('-gpios') or name.endswith('-gpio'): return ('cells', '#gpio-cells')
+    if name in FIXED_CELLS: return ('fixed', FIXED_CELLS[name])
+    if name in SINGLE or name.endswith('-supply') or (name.startswith('pinctrl-') and name[8:].isdigit()):
+        return ('single', 0)
+    return None
+
+def find_refs(ours):
+    """Return ({id(node): {prop: [cell offsets holding a phandle]}}, {phandle: node}, [audit lines])."""
+    byph = {}
+    for _, n in walk(ours):
+        ph = phandle_of(n)
+        if ph is not None: byph[ph] = n
+    refs, audit = {}, []
+    for path, n in walk(ours):
+        for k, v in n.props:
+            kind = ref_kind(k)
+            if kind is None:
+                if k not in NOT_PH and not k.endswith('-names') and not k.startswith('#') and len(v) % 4 == 0 and v:
+                    cells = [struct.unpack('>I', v[i:i+4])[0] for i in range(0, len(v), 4)]
+                    if any(c in byph for c in cells) and len(v) <= 64 and not (v.endswith(b'\0') and v[:1].isalpha()):
+                        audit.append('/'.join(path) + ':' + k)
+                continue
+            if len(v) % 4: raise SystemExit('bad length of %s:%s' % ('/'.join(path), k))
+            cells = [struct.unpack('>I', v[i:i+4])[0] for i in range(0, len(v), 4)]
+            i, offs = 0, []
+            while i < len(cells):
+                h = cells[i]
+                if kind[0] == 'single': argc = 0
+                elif kind[0] == 'fixed': argc = kind[1]
+                elif h == 0: argc = 0  # empty entry
+                else:
+                    if h not in byph:
+                        raise SystemExit('%s:%s references phandle %d that is not in our DTB' % ('/'.join(path), k, h))
+                    cp = dict(byph[h].props).get(kind[1])
+                    if cp is None: raise SystemExit('%s:%s: provider %s has no %s' % ('/'.join(path), k, byph[h].name, kind[1]))
+                    argc = struct.unpack('>I', cp)[0]
+                if h != 0:
+                    if h not in byph: raise SystemExit('%s:%s references unknown phandle %d' % ('/'.join(path), k, h))
+                    offs.append(i * 4)
+                i += 1 + argc
+            if i != len(cells):
+                raise SystemExit('%s:%s: cell count does not match the provider #cells' % ('/'.join(path), k))
+            if offs: refs.setdefault(id(n), {})[k] = offs
+    return refs, byph, audit
+
 def remap_phandles(stock, ours, top, acts):
-    fx = kid(ours, '__local_fixups__')
-    if fx is None:
-        raise SystemExit('our DTB has no __local_fixups__: build it with DTC_FLAGS=-@')
+    refs, byph, audit = find_refs(ours)
+    for a in (audit if os.environ.get('A01Q_AUDIT') else []):
+        sys.stderr.write('audit: %s has numbers equal to a phandle (not treated as a reference)\n' % a)
     # stock phandle space
     used = [phandle_of(n) for _, n in walk(stock) if phandle_of(n)]
-    nxt = max(used) + 1
-    # which of our subtrees survive, and what they map onto
-    keep = {}  # id(node) -> (path, counterpart or None)
+    nxt = [max(used) + 1]
+    keep = {}  # id(node) -> stock counterpart or None, for every node of ours that survives
     def mark(n, path, counterpart_ok):
-        cp = stock_counterpart(stock, path) if counterpart_ok else None
-        keep[id(n)] = (path, cp)
+        keep[id(n)] = stock_counterpart(stock, path) if counterpart_ok else None
         for c in n.kids: mark(c, path + (pname(c),), counterpart_ok)
     root = (pname(stock),)
     for c in top: mark(c, root + (pname(c),), True)
     s_name = pname(kid(stock, 'soc'))
     for c, how in acts:
         if how != 'drop': mark(c, root + (s_name, pname(c)), how != 'add')
-    # old phandle -> new
-    mp = {}
-    def collect(n):
-        ph = phandle_of(n)
-        if ph is not None and id(n) in keep:
-            path, cp = keep[id(n)]
+    mp, dead = {}, {}
+    for ph, n in byph.items():
+        if id(n) in keep:
+            cp = keep[id(n)]
             sp = phandle_of(cp) if cp is not None else None
             if sp is not None: mp[ph] = sp
             else:
-                mp[ph] = nonlocal_nxt[0]; nonlocal_nxt[0] += 1
-        elif ph is not None:
-            dropped[ph] = n.name
-        for c in n.kids: collect(c)
-    nonlocal_nxt = [nxt]; dropped = {}
-    collect(ours)
-    dead = {}
-    for ph in dropped:
-        dead[ph] = 0xffff0000 + ph  # unresolvable on purpose, never collides
+                mp[ph] = nxt[0]; nxt[0] += 1
+        else:
+            dead[ph] = 0xffff0000 + ph  # unresolvable on purpose, never collides with a real node
     mp.update(dead)
-    # apply
-    def fix_node(n, fnode):
-        offs = {k: v for k, v in (fnode.props if fnode is not None else [])}
+    def fix(n):
+        offs = refs.get(id(n), {})
         new = []
         for k, v in n.props:
             if k in ('phandle', 'linux,phandle') and len(v) == 4:
-                v = struct.pack('>I', mp.get(struct.unpack('>I', v)[0], struct.unpack('>I', v)[0]))
+                old = struct.unpack('>I', v)[0]; v = struct.pack('>I', mp.get(old, old))
             elif k in offs:
                 b = bytearray(v)
-                for o in range(0, len(offs[k]), 4):
-                    off = struct.unpack('>I', offs[k][o:o+4])[0]
+                for off in offs[k]:
                     old = struct.unpack('>I', b[off:off+4])[0]
-                    if old in dead:
-                        sys.stderr.write('warning: %s/%s references dropped node (phandle %d)\n' % (n.name, k, old))
+                    if old in dead and id(n) in keep:
+                        sys.stderr.write('warning: %s:%s references a node that is not part of the result\n' % (n.name, k))
                     b[off:off+4] = struct.pack('>I', mp.get(old, old))
                 v = bytes(b)
             new.append((k, v))
         n.props = new
-        for c in n.kids:
-            fc = next((x for x in (fnode.kids if fnode is not None else []) if x.name == c.name or (base(x) == 'soc' and base(c) == 'soc')), None)
-            fix_node(c, fc)
-    fix_node(ours, fx)
+        for c in n.kids: fix(c)
+    fix(ours)
     ours.kids = [c for c in ours.kids if c.name not in ('__local_fixups__', '__symbols__', '__fixups__')]
     return len(mp) - len(dead), len(dead)
 
