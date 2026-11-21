@@ -43,15 +43,23 @@ jobs:
         run: |
           make defconfig a01q.config a01q-touch-wifi.config
           sh scripts/a01q-trim.sh
+          # Diagnostic PID 1 built into the kernel; used only when the boot.img command line has
+          # rdinit=/diag-init (otherwise the Android ramdisk runs as before).
+          aarch64-linux-gnu-gcc -static -Os -o "$RUNNER_TEMP/diag-init" diag/diag-init.c
+          printf '%s\n' 'dir /dev 0755 0 0' 'nod /dev/console 0600 0 0 c 5 1' 'nod /dev/null 0666 0 0 c 1 3' \
+                  'dir /proc 0555 0 0' 'dir /sys 0555 0 0' "file /diag-init $RUNNER_TEMP/diag-init 0755 0 0" \
+                  > "$RUNNER_TEMP/diag.list"
+          scripts/config --set-str INITRAMFS_SOURCE "$RUNNER_TEMP/diag.list"
           make olddefconfig
           # Fail early if an option the board needs to boot was silently dropped
           # (olddefconfig ignores unknown/unmet symbols without any error).
           for o in ARCH_QCOM MSM_GCC_8917 PINCTRL_MSM8917 QCOM_CLK_SMD_RPM QCOM_SMD_RPM \
                    REGULATOR_QCOM_SMD_RPM REGULATOR_QCOM_SPMI SPMI_MSM_PMIC_ARB MMC_SDHCI_MSM \
                    DRM_SIMPLEDRM FRAMEBUFFER_CONSOLE PSTORE_RAM TOUCHSCREEN_EDT_FT5X06 \
-                   HWSPINLOCK_QCOM QCOM_SMEM; do
+                   HWSPINLOCK_QCOM QCOM_SMEM SECURITY SECURITY_SELINUX AUDIT; do
             grep -q "^CONFIG_$o=y" .config || { echo "::error::CONFIG_$o is not =y"; MISSING=1; }
           done
+          grep -E "^CONFIG_(LSM|SECURITY_SELINUX)" .config
           [ -z "$MISSING" ] || exit 1
 
       - name: Build
@@ -65,11 +73,24 @@ jobs:
       - name: Package
         working-directory: linux
         run: |
+          set -o pipefail
           mkdir -p out
           cp arch/arm64/boot/Image.gz out/
           # DTB the stock Samsung bootloader accepts (stock DTB + our nodes), see the script header
           python3 scripts/a01q-dtb-merge.py ../a01q/stock/a01q-stock-boot.dtb \
-                  arch/arm64/boot/dts/qcom/msm8937-samsung-a01q.dtb out/boot_dump.img-dtb
+                  arch/arm64/boot/dts/qcom/msm8937-samsung-a01q.dtb out/boot_dump.img-dtb 2>&1 | tee out/merge.log
+          # Bisect set for a hardware reset after the kernel starts: same kernel, DTBs with one driver
+          # family switched off each (see --off in the script). Swap only the DTB in the boot.img.
+          mkdir -p out/bisect
+          M="python3 scripts/a01q-dtb-merge.py ../a01q/stock/a01q-stock-boot.dtb arch/arm64/boot/dts/qcom/msm8937-samsung-a01q.dtb"
+          $M out/bisect/B1_all_suspects_off.dtb --off=smmu,tsens,pmic,wdt
+          $M out/bisect/B2_only_smmu_on.dtb     --off=tsens,pmic,wdt
+          $M out/bisect/B3_only_tsens_on.dtb    --off=smmu,pmic,wdt
+          $M out/bisect/B4_only_pmic_on.dtb     --off=smmu,tsens,wdt
+          $M out/bisect/B5_only_wdt_on.dtb      --off=smmu,tsens,pmic
+          $M out/bisect/B0_off_plus_no_dload.dtb --off=smmu,tsens,pmic,wdt,dload
+          # readable copy of the merged DTB, for debugging only (small)
+          scripts/dtc/dtc -I dtb -O dts -o out/boot_dump.dts out/boot_dump.img-dtb 2>/dev/null || true
           cp .config out/config
           make -s kernelrelease > out/kernelrelease
 
