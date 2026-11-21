@@ -48,17 +48,17 @@
 
 		/*
 		 * Splash framebuffer set up by the bootloader.
-		 * FIXME: pixel format is unconfirmed (a8r8g8b8 vs r8g8b8); if the
-		 * colors or stride look wrong, switch to r8g8b8 and
-		 * stride = 720 * 3, and shrink both reg sizes accordingly.
+		 * Pixel format: a8r8g8b8 (stride 720 * 4) produced a tiled, striped image
+		 * on hardware, so the LK framebuffer is assumed to be r8g8b8 (stride 720 * 3).
+		 * If the colors are swapped or the picture is still wrong, try b8g8r8.
 		 */
 		framebuffer0: framebuffer@90000000 {
 			compatible = "simple-framebuffer";
-			reg = <0x0 0x90000000 0x0 (720 * 1520 * 4)>;
+			reg = <0x0 0x90000000 0x0 (720 * 1520 * 3)>;
 			width = <720>;
 			height = <1520>;
-			stride = <(720 * 4)>;
-			format = "a8r8g8b8";
+			stride = <(720 * 3)>;
+			format = "r8g8b8";
 
 			clocks = <&gcc GCC_MDSS_AHB_CLK>,
 				 <&gcc GCC_MDSS_AXI_CLK>,

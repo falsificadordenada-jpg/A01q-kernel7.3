@@ -77,8 +77,18 @@ def kid(n, name):
 SOC_REPLACE = ['interrupt-controller@b000000', 'timer@b120000', 'restart@4ab000',
                'serial@78b0000', 'usb@78db000', 'i2c@78b7000', 'i2c@78b8000',
                'i2c@7af5000', 'spi@78b7000', 'spi@7af6000']
+# Android's first-stage init looks for the boot device by the name on the kernel command line
+# (androidboot.bootdevice=7824900.sdhci) and the stock fstab uses /dev/block/platform/soc/7824900.sdhci.
+# Mainline calls the node mmc@..., which would make the device 7824900.mmc, so the nodes are renamed
+# and then replace the (disabled) stock nodes of the same name.
+RENAME = {'mmc@7824900': 'sdhci@7824900', 'mmc@7864900': 'sdhci@7864900'}
+SOC_REPLACE += list(RENAME.values())
 # Kept as in the stock DTB: 'i2c@78b6000' (LK needs it) and 'pinctrl@1000000' (merged below).
 PINCTRL_PROPS = ('gpio-ranges', 'gpio-reserved-ranges', 'interrupts')
+# The stock pinctrl node routes its summary IRQ through the MPM "wake-gic" (interrupts-extended and
+# its own interrupt-parent). Mainline has no driver for that controller, so the pinctrl driver
+# would defer forever and take every consumer (eMMC, I2C, keys, ...) with it. Use ours instead.
+PINCTRL_DROP = ('interrupts-extended', 'interrupt-parent')
 
 def find_stock(b):
     """The stock boot.img DTB file holds several DTBs; pick the sdm439 one (msm-id 353)."""
@@ -138,19 +148,19 @@ CELLS_PROP = {
     'interrupts-extended': '#interrupt-cells', 'qcom,smem-states': '#qcom,smem-state-cells',
     'thermal-sensors': '#thermal-sensor-cells', 'gpios': '#gpio-cells', 'gpio': '#gpio-cells',
 }
-FIXED_CELLS = {'cooling-device': 2, 'qcom,ipc': 2, 'qcom,ipc-1': 2, 'qcom,ipc-2': 2, 'gpio-ranges': 3,
+FIXED_CELLS = {'qcom,dload-mode': 1, 'cooling-device': 2, 'qcom,ipc': 2, 'qcom,ipc-1': 2, 'qcom,ipc-2': 2, 'gpio-ranges': 3,
                'qcom,rpm-msg-ram': 0}
 SINGLE = {'interrupt-parent', 'memory-region', 'next-level-cache', 'phy-handle', 'remote-endpoint',
           'operating-points-v2', 'required-opps', 'cpu', 'sram', 'syscon', 'trip', 'port', 'sleep-state',
           'nvmem-cells', 'cpu-idle-states', 'domain-idle-states', 'msi-parent', 'qcom,rpm-msg-ram',
-          'power-domain', 'qcom,smd-edge', 'vdd-supply', 'phandle-prop'}
+          'power-domain', 'qcom,smd-edge', 'vdd-supply', 'phandle-prop', 'nvmem', 'qcom,pbs', 'qcom,mmio'}
 # properties that never hold phandles (used only to keep the audit below quiet)
 NOT_PH = {'reg', 'ranges', 'dma-ranges', 'interrupts', 'compatible', 'status', 'phandle', 'linux,phandle',
           'device_type', 'model', 'label', 'bootargs', 'stdout-path', 'name', 'regulator-name',
           'gpio-reserved-ranges', 'interrupt-map', 'interrupt-map-mask', 'opp-hz', 'opp-microvolt',
           'opp-level', 'opp-peak-kBps', 'qcom,smem', 'qcom,local-pid', 'qcom,remote-pid', 'no-map',
           'size', 'alignment', 'alloc-ranges', 'qcom,client-id', 'cpu-release-addr', 'enable-method',
-          'bits', 'drive-strength', 'cache-level', 'qcom,dload-mode', 'qcom,pmic-id', 'bias-disable', 'bias-pull-up',
+          'bits', 'drive-strength', 'cache-level', 'qcom,pmic-id', 'bias-disable', 'bias-pull-up',
           'bias-pull-down', 'output-high', 'output-low', 'qcom,ipc-id', 'qcom,smd-channels', 'qcom,remote-pid'}
 
 def ref_kind(name):
@@ -248,7 +258,14 @@ def remap_phandles(stock, ours, top, acts):
     ours.kids = [c for c in ours.kids if c.name not in ('__local_fixups__', '__symbols__', '__fixups__')]
     return len(mp) - len(dead), len(dead)
 
+def first_compat(n):
+    v = dict(n.props).get('compatible')
+    return v.split(b'\0')[0] if v else None
+
 def merge(stock, ours):
+    o_soc = kid(ours, 'soc')
+    for c in o_soc.kids:
+        c.name = RENAME.get(c.name, c.name)
     top, acts = plan(stock, ours)
     n_map, n_dead = remap_phandles(stock, ours, top, acts)
     sys.stderr.write('phandles: %d remapped, %d dropped\n' % (n_map, n_dead))
@@ -267,7 +284,9 @@ def merge(stock, ours):
             s_soc.kids = [x for x in s_soc.kids if x.name != c.name]
             s_soc.kids.append(copy.deepcopy(c))
         elif how == 'merge':
-            sp = have['pinctrl@1000000']; names = {k for k, v in sp.props}
+            sp = have['pinctrl@1000000']
+            sp.props = [(k, v) for k, v in sp.props if k not in PINCTRL_DROP]
+            names = {k for k, v in sp.props}
             for k, v in c.props:
                 if k in PINCTRL_PROPS and k not in names: sp.props.append((k, v))
             kn = {x.name for x in sp.kids}
@@ -275,6 +294,19 @@ def merge(stock, ours):
         elif how == 'add':
             s_soc.kids.append(copy.deepcopy(c))
         # 'drop': same name as a stock node and not listed -> the stock node wins
+    # Stock (downstream) nodes that a mainline driver would also bind, and that duplicate a node of
+    # ours (same compatible), are switched off: they steal the memory region / IRQ of our node or
+    # fail to probe (smem without memory-region, SPMI, SMP2P, TSENS, the second arch timer).
+    # They stay in the tree because the stock DTBO and the bootloader expect them.
+    ours_compat = {first_compat(n) for _, n in walk(ours)} - {None, b'regulator-fixed'}
+    installed = {c.name for c, how in acts if how in ('replace', 'add')}
+    off = []
+    for c in s_soc.kids:
+        if c.name in installed or c.name == 'pinctrl@1000000': continue
+        if first_compat(c) in ours_compat:
+            c.props = [(k, v) for k, v in c.props if k != 'status'] + [('status', b'disabled\0')]
+            off.append(c.name)
+    sys.stderr.write('stock nodes disabled (duplicates of ours): %s\n' % ', '.join(off))
     return stock
 
 if __name__ == '__main__':
