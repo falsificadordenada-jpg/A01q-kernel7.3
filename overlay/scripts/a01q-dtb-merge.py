@@ -309,10 +309,30 @@ def merge(stock, ours):
     sys.stderr.write('stock nodes disabled (duplicates of ours): %s\n' % ', '.join(off))
     return stock
 
+# Bisect switches for bring-up (--off=smmu,tsens,pmic,wdt,dload): each one switches a driver family
+# off in the result so a hardware reset can be traced to its source with one DTB per flash.
+OFF = {'smmu': ('iommu@1c40000', 'iommu@1e20000'), 'tsens': ('thermal-sensor@4a9000',),
+       'pmic': ('spmi@200f000',), 'wdt': ('watchdog@b017000',)}
+
+def apply_off(root, tokens):
+    soc = kid(root, 'soc')
+    for t in tokens:
+        if t == 'dload':
+            scm = kid(kid(root, 'firmware'), 'scm')
+            scm.props = [(k, v) for k, v in scm.props if k != 'qcom,dload-mode']
+            continue
+        if t not in OFF: raise SystemExit('unknown --off token: %s' % t)
+        for c in soc.kids:
+            if c.name in OFF[t]:
+                c.props = [(k, v) for k, v in c.props if k != 'status'] + [('status', b'disabled\0')]
+    return root
+
 if __name__ == '__main__':
-    if len(sys.argv) != 4: raise SystemExit(__doc__)
-    stock = find_stock(open(sys.argv[1], 'rb').read())
-    ours, _ = load(open(sys.argv[2], 'rb').read())
-    out = dump(merge(stock, ours))
-    open(sys.argv[3], 'wb').write(out)
-    print('wrote %s (%d bytes)' % (sys.argv[3], len(out)))
+    args = [a for a in sys.argv[1:] if not a.startswith('--off=')]
+    off = [t for a in sys.argv[1:] if a.startswith('--off=') for t in a[6:].split(',') if t]
+    if len(args) != 3: raise SystemExit(__doc__)
+    stock = find_stock(open(args[0], 'rb').read())
+    ours, _ = load(open(args[1], 'rb').read())
+    out = dump(apply_off(merge(stock, ours), off))
+    open(args[2], 'wb').write(out)
+    print('wrote %s (%d bytes)%s' % (args[2], len(out), ' off=' + ','.join(off) if off else ''))
