@@ -56,3 +56,4 @@ from the stock boot.img header; keep the stock `androidboot.*` args).
   typo or a missing Kconfig symbol on the first build.
 - Vendor (4.19) modules such as `fts_ts` or `wlan.ko` do NOT load on a 7.x kernel.
   Use in-tree drivers instead: `edt-ft5x06` (touch) and `wcn36xx` + WCNSS (Wi-Fi).
+  (this is a vibecoded project)
