@@ -13,6 +13,15 @@ Result = stock DTB (the sdm439 / msm-id 353 one)
            pinctrl@1000000 stays stock but gets our properties and our pin states added,
            every other node of our /soc is added.
 
+Phandles: a pstore log from a real boot showed that our phandle numbers collide with the stock
+ones (e.g. a "gpios" reference of ours resolved to /soc/ad-hoc-bus/fab-bimc, the timer lost its
+interrupt parent, smem lost its memory-region). Our DTB must therefore be built with
+`DTC_FLAGS=-@` so that it carries `__local_fixups__`; the script then renumbers every phandle of
+our nodes: a node that replaces/merges into a stock node takes that stock node's phandle (LK
+needs it for the DTBO overlay targets, and the stock root `interrupt-parent` keeps working),
+every other node of ours gets a fresh number above the stock ones. The stock root
+`interrupt-parent` (the downstream MPM "wake-gic", no mainline driver) is replaced by ours (the GIC).
+
 Pure python, no dependencies. Usage:
   a01q-dtb-merge.py STOCK_BOOT_DTB OURS_DTB OUT_DTB
 """
@@ -82,26 +91,131 @@ def find_stock(b):
         off += total
     raise SystemExit('no msm-id 353 DTB found in the stock file')
 
-def merge(stock, ours):
+def pname(n):
+    return 'soc' if base(n) == 'soc' else n.name
+
+def phandle_of(n):
+    for k, v in n.props:
+        if k in ('phandle', 'linux,phandle') and len(v) == 4:
+            return struct.unpack('>I', v)[0]
+    return None
+
+def walk(n, path=()):
+    p = path + (pname(n),)
+    yield p, n
+    for c in n.kids:
+        yield from walk(c, p)
+
+def plan(stock, ours):
+    """Decide which of our nodes end up in the result. Returns (top_replace, soc_actions)."""
     s_soc, o_soc = kid(stock, 'soc'), kid(ours, 'soc')
-    for c in ours.kids:
-        if base(c) == 'soc': continue
+    have = {c.name: c for c in s_soc.kids}
+    top = [c for c in ours.kids if base(c) != 'soc']
+    acts = []  # (our node, 'replace'|'merge'|'add'|'drop')
+    for c in o_soc.kids:
+        if c.name in SOC_REPLACE: acts.append((c, 'replace'))
+        elif c.name == 'pinctrl@1000000': acts.append((c, 'merge'))
+        elif c.name not in have: acts.append((c, 'add'))
+        else: acts.append((c, 'drop'))
+    return top, acts
+
+def stock_counterpart(stock, path):
+    """Stock node at the same (normalised) path, or None. path[0] is the root name."""
+    n = stock
+    for name in path[1:]:
+        n = next((c for c in n.kids if pname(c) == name or base(c) == name), None)
+        if n is None: return None
+    return n
+
+def remap_phandles(stock, ours, top, acts):
+    fx = kid(ours, '__local_fixups__')
+    if fx is None:
+        raise SystemExit('our DTB has no __local_fixups__: build it with DTC_FLAGS=-@')
+    # stock phandle space
+    used = [phandle_of(n) for _, n in walk(stock) if phandle_of(n)]
+    nxt = max(used) + 1
+    # which of our subtrees survive, and what they map onto
+    keep = {}  # id(node) -> (path, counterpart or None)
+    def mark(n, path, counterpart_ok):
+        cp = stock_counterpart(stock, path) if counterpart_ok else None
+        keep[id(n)] = (path, cp)
+        for c in n.kids: mark(c, path + (pname(c),), counterpart_ok)
+    root = (pname(stock),)
+    for c in top: mark(c, root + (pname(c),), True)
+    s_name = pname(kid(stock, 'soc'))
+    for c, how in acts:
+        if how != 'drop': mark(c, root + (s_name, pname(c)), how != 'add')
+    # old phandle -> new
+    mp = {}
+    def collect(n):
+        ph = phandle_of(n)
+        if ph is not None and id(n) in keep:
+            path, cp = keep[id(n)]
+            sp = phandle_of(cp) if cp is not None else None
+            if sp is not None: mp[ph] = sp
+            else:
+                mp[ph] = nonlocal_nxt[0]; nonlocal_nxt[0] += 1
+        elif ph is not None:
+            dropped[ph] = n.name
+        for c in n.kids: collect(c)
+    nonlocal_nxt = [nxt]; dropped = {}
+    collect(ours)
+    dead = {}
+    for ph in dropped:
+        dead[ph] = 0xffff0000 + ph  # unresolvable on purpose, never collides
+    mp.update(dead)
+    # apply
+    def fix_node(n, fnode):
+        offs = {k: v for k, v in (fnode.props if fnode is not None else [])}
+        new = []
+        for k, v in n.props:
+            if k in ('phandle', 'linux,phandle') and len(v) == 4:
+                v = struct.pack('>I', mp.get(struct.unpack('>I', v)[0], struct.unpack('>I', v)[0]))
+            elif k in offs:
+                b = bytearray(v)
+                for o in range(0, len(offs[k]), 4):
+                    off = struct.unpack('>I', offs[k][o:o+4])[0]
+                    old = struct.unpack('>I', b[off:off+4])[0]
+                    if old in dead:
+                        sys.stderr.write('warning: %s/%s references dropped node (phandle %d)\n' % (n.name, k, old))
+                    b[off:off+4] = struct.pack('>I', mp.get(old, old))
+                v = bytes(b)
+            new.append((k, v))
+        n.props = new
+        for c in n.kids:
+            fc = next((x for x in (fnode.kids if fnode is not None else []) if x.name == c.name or (base(x) == 'soc' and base(c) == 'soc')), None)
+            fix_node(c, fc)
+    fix_node(ours, fx)
+    ours.kids = [c for c in ours.kids if c.name not in ('__local_fixups__', '__symbols__', '__fixups__')]
+    return len(mp) - len(dead), len(dead)
+
+def merge(stock, ours):
+    top, acts = plan(stock, ours)
+    n_map, n_dead = remap_phandles(stock, ours, top, acts)
+    sys.stderr.write('phandles: %d remapped, %d dropped\n' % (n_map, n_dead))
+    s_soc = kid(stock, 'soc')
+    have = {c.name: c for c in s_soc.kids}
+    # The stock root `interrupt-parent` is the downstream MPM "wake-gic", which mainline has no
+    # driver for: top-level nodes without their own parent (the arch timer!) would get no IRQs.
+    o_ip = next((v for k, v in ours.props if k == 'interrupt-parent'), None)
+    if o_ip is not None:
+        stock.props = [(k, o_ip if k == 'interrupt-parent' else v) for k, v in stock.props]
+    for c in top:
         stock.kids = [x for x in stock.kids if base(x) != base(c)]
         stock.kids.append(copy.deepcopy(c))
-    have = {c.name: c for c in s_soc.kids}
-    for c in o_soc.kids:
-        if c.name in SOC_REPLACE:
+    for c, how in acts:
+        if how == 'replace':
             s_soc.kids = [x for x in s_soc.kids if x.name != c.name]
             s_soc.kids.append(copy.deepcopy(c))
-        elif c.name == 'pinctrl@1000000':
+        elif how == 'merge':
             sp = have['pinctrl@1000000']; names = {k for k, v in sp.props}
             for k, v in c.props:
                 if k in PINCTRL_PROPS and k not in names: sp.props.append((k, v))
             kn = {x.name for x in sp.kids}
             sp.kids += [copy.deepcopy(x) for x in c.kids if x.name not in kn]
-        elif c.name not in have:
+        elif how == 'add':
             s_soc.kids.append(copy.deepcopy(c))
-        # same name as a stock node and not listed: the stock node wins
+        # 'drop': same name as a stock node and not listed -> the stock node wins
     return stock
 
 if __name__ == '__main__':
