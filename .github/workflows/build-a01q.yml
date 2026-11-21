@@ -29,7 +29,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross bc bison flex libssl-dev libelf-dev \
             device-tree-compiler lz4 zstd ccache
 
       - uses: actions/cache@v4
