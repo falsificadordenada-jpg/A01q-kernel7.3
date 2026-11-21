@@ -311,7 +311,7 @@ def merge(stock, ours):
 
 # Bisect switches for bring-up (--off=smmu,tsens,pmic,wdt,dload): each one switches a driver family
 # off in the result so a hardware reset can be traced to its source with one DTB per flash.
-OFF = {'smmu': ('iommu@1c40000', 'iommu@1e20000'), 'tsens': ('thermal-sensor@4a9000',),
+OFF = {'smmu': ('iommu@1c40000', 'iommu@1e20000'), 'smmu_gpu': ('iommu@1c40000',), 'smmu_mdp': ('iommu@1e20000',), 'tsens': ('thermal-sensor@4a9000',),
        'pmic': ('spmi@200f000',), 'wdt': ('watchdog@b017000',)}
 
 def apply_off(root, tokens):

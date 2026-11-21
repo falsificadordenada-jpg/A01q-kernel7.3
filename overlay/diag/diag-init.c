@@ -35,10 +35,38 @@ static void ls(const char *path)
 	closedir(d);
 }
 
+static void regulator_names(void)
+{
+	char path[96], name[64];
+	struct dirent *e;
+	DIR *d = opendir("/sys/class/regulator");
+	if (!d) return;
+	while ((e = readdir(d))) {
+		if (e->d_name[0] == '.') continue;
+		snprintf(path, sizeof path, "/sys/class/regulator/%s/name", e->d_name);
+		FILE *f = fopen(path, "r");
+		if (!f) continue;
+		if (fgets(name, sizeof name, f)) { name[strcspn(name, "\n")] = 0; printf("  %s=%s", e->d_name, name); }
+		fclose(f);
+	}
+	printf("\n");
+	closedir(d);
+}
+
+static void save_log_to_pstore(char *buf, size_t len)
+{
+	/* Writes the full kernel log to pmsg: it shows up as pmsg-ramoops-0 in TWRP after a warm reboot. */
+	int n = klogctl(3, buf, len - 1), fd = open("/dev/pmsg0", O_WRONLY);
+	if (fd >= 0 && n > 0) { write(fd, buf, n); close(fd); printf("(full log written to pmsg, %d bytes)\n", n); }
+	else printf("(pmsg write failed)\n");
+}
+
 static int interesting(const char *l)
 {
 	static const char *k[] = { "mmc", "sdhci", "pinctrl", "regulator", "rpm", "smd", "smem",
-		"scm", "spmi", "mbox", "gcc", "probe", "deferred", "Kernel panic", "BUG", "Oops", NULL };
+		"scm", "spmi", "pm8937", "hwspinlock", "deferred", "failed", "error", "Kernel panic",
+		"BUG", "Oops", NULL };
+	if (strstr(l, "+0x") || strstr(l, "sync_state") || strstr(l, "mboxes")) return 0; /* backtraces, noise */
 	for (int i = 0; k[i]; i++) if (strstr(l, k[i])) return 1;
 	return 0;
 }
@@ -62,7 +90,7 @@ int main(void)
 		printf("== /proc/partitions ==\n"); cat("/proc/partitions", 14);
 		printf("== /sys/class/mmc_host ==\n"); ls("/sys/class/mmc_host");
 		printf("== /sys/block ==\n"); ls("/sys/block");
-		printf("== /sys/class/regulator (count) ==\n"); ls("/sys/class/regulator");
+		printf("== regulators ==\n"); regulator_names();
 		printf("== kernel messages (storage/pinctrl/rpm/...) ==\n");
 		int n = klogctl(3, buf, sizeof buf - 1);
 		if (n > 0) {
@@ -70,7 +98,8 @@ int main(void)
 			buf[n] = 0;
 			for (char *p = strtok(buf, "\n"); p && cnt < 4000; p = strtok(NULL, "\n"))
 				if (interesting(p)) lines[cnt++] = p;
-			for (int i = cnt > 30 ? cnt - 30 : 0; i < cnt; i++) printf("%.88s\n", lines[i]);
+			for (int i = cnt > 45 ? cnt - 45 : 0; i < cnt; i++) printf("%.88s\n", lines[i]);
 		}
+		if (round == 3) save_log_to_pstore(buf, sizeof buf);
 	}
 }
