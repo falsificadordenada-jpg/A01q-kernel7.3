@@ -54,6 +54,61 @@ static void regulator_names(void)
 	closedir(d);
 }
 
+/* Why is a device not probed? Print each fw_devlink supplier link of the consumer and its status
+ * ("available" = supplier ready; "dormant"/"consumer probing" = still waiting for that supplier). */
+static void devlinks_of(const char *consumer)
+{
+	char path[300], st[48];
+	struct dirent *e;
+	size_t cl = strlen(consumer);
+	DIR *d = opendir("/sys/class/devlink");
+	if (!d) { printf("  (no /sys/class/devlink)\n"); return; }
+	while ((e = readdir(d))) {
+		size_t n = strlen(e->d_name);
+		if (n <= cl || strcmp(e->d_name + n - cl, consumer)) continue;
+		snprintf(path, sizeof path, "/sys/class/devlink/%.200s/status", e->d_name);
+		FILE *f = fopen(path, "r");
+		st[0] = 0;
+		if (f) { if (fgets(st, sizeof st, f)) st[strcspn(st, "\n")] = 0; fclose(f); }
+		/* "platform:SUPPLIER--platform:CONSUMER": print only the supplier part */
+		char *sep = strstr(e->d_name, "--");
+		if (sep) *sep = 0;
+		printf("  %-14s <- %.50s\n", st, e->d_name);
+	}
+	closedir(d);
+}
+
+static void ls_filter(const char *path, const char *a, const char *b, const char *c)
+{
+	struct dirent *e;
+	DIR *d = opendir(path);
+	if (!d) { printf("  (no %s)\n", path); return; }
+	while ((e = readdir(d)))
+		if (e->d_name[0] != '.' && (strstr(e->d_name, a) || strstr(e->d_name, b) || strstr(e->d_name, c)))
+			printf("  %s", e->d_name);
+	printf("\n");
+	closedir(d);
+}
+
+static void why_page(void)
+{
+	printf("\033[2J\033[H");
+	printf("A01Q DIAG  WHY NOT PROBED\n");
+	printf("== devices_deferred (debugfs) ==\n");
+	cat("/sys/kernel/debug/devices_deferred", 22);
+	printf("== sdhci 7824900 (eMMC): suppliers ==\n"); devlinks_of("platform:7824900.sdhci");
+	printf("== gpio-keys: suppliers ==\n"); devlinks_of("platform:gpio-keys");
+	printf("== i2c 78b7000: suppliers ==\n"); devlinks_of("platform:78b7000.i2c");
+	printf("== gpiochips ==\n"); ls("/sys/class/gpio");
+	printf("== rpmsg devices ==\n"); ls("/sys/bus/rpmsg/devices");
+	printf("== platform devices: rpm/smd/smem/pinctrl/hwlock ==\n");
+	ls_filter("/sys/bus/platform/devices", "rpm", "smd", "smem");
+	ls_filter("/sys/bus/platform/devices", "pinctrl", "hwlock", "mutex");
+	printf("== bound drivers ==\n");
+	ls_filter("/sys/bus/platform/drivers", "pinctrl", "smem", "rpm");
+	ls_filter("/sys/bus/platform/drivers", "sdhci", "qcom-apcs", "hwspin");
+}
+
 static int interesting(const char *l)
 {
 	static const char *k[] = { "mmc", "sdhci", "pinctrl", "regulator", "rpm", "smd", "smem",
@@ -83,7 +138,7 @@ static void summary(char *buf, size_t sz, int round)
 		buf[n] = 0;
 		for (char *p = strtok(buf, "\n"); p && cnt < 8000; p = strtok(NULL, "\n"))
 			if (interesting(p)) lines[cnt++] = p;
-		for (int i = cnt > 40 ? cnt - 40 : 0; i < cnt; i++) printf("%.88s\n", lines[i]);
+		for (int i = cnt > 30 ? cnt - 30 : 0; i < cnt; i++) printf("%.88s\n", lines[i]);
 	}
 }
 
@@ -115,12 +170,15 @@ int main(void)
 	mount("proc", "/proc", "proc", 0, NULL);
 	mount("sysfs", "/sys", "sysfs", 0, NULL);
 	mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
+	mount("debugfs", "/sys/kernel/debug", "debugfs", 0, NULL);
 	if (freopen("/dev/console", "w", stdout)) setvbuf(stdout, NULL, _IONBF, 0);
 
 	for (;;) {
 		sleep(round ? 1 : 15); /* let the deferred probes finish first */
 		summary(buf, sizeof buf, round++);
 		sleep(8);
+		why_page();
+		sleep(14);
 		log_pages(buf, sizeof buf);
 	}
 }
