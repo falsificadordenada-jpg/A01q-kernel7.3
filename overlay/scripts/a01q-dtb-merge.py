@@ -305,6 +305,9 @@ def merge(stock, ours):
     # fail to probe (smem without memory-region, SPMI, SMP2P, TSENS, the second arch timer).
     # They stay in the tree because the stock DTBO and the bootloader expect them.
     ours_compat = {first_compat(n) for _, n in walk(ours)} - {None, b'regulator-fixed'}
+    # The stock PMU node ("arm,armv8-pmuv3", IRQ type 0 = invalid) duplicates our "arm,cortex-a53-pmu":
+    # it makes the kernel print "HW irq 23 has invalid type" warnings. Treat the two as the same.
+    if b'arm,cortex-a53-pmu' in ours_compat: ours_compat.add(b'arm,armv8-pmuv3')
     installed = {c.name for c, how in acts if how in ('replace', 'add')}
     off = []
     for c in s_soc.kids:
