@@ -78,7 +78,7 @@ jobs:
           cp arch/arm64/boot/Image.gz out/
           # DTB the stock Samsung bootloader accepts (stock DTB + our nodes), see the script header
           python3 scripts/a01q-dtb-merge.py ../a01q/stock/a01q-stock-boot.dtb \
-                  arch/arm64/boot/dts/qcom/msm8937-samsung-a01q.dtb out/boot_dump.img-dtb 2>&1 | tee out/merge.log
+                  arch/arm64/boot/dts/qcom/msm8937-samsung-a01q.dtb out/boot_dump.img-dtb --off=smmu_gpu 2>&1 | tee out/merge.log
           # Bisect set for a hardware reset after the kernel starts: same kernel, DTBs with one driver
           # family switched off each (see --off in the script). Swap only the DTB in the boot.img.
           mkdir -p out/bisect
