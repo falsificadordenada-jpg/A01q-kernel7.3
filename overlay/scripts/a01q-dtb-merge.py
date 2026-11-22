@@ -290,10 +290,10 @@ def merge(stock, ours):
             # uses "qcom,msm8917-pinctrl" for the whole family). Without this, the pinctrl never
             # probes and every consumer (eMMC, I2C, keys) waits for it forever. Take compatible,
             # gpio-ranges and the IRQ from our node, which is the one the driver understands.
-            ours = {k: v for k, v in c.props if k in PINCTRL_PROPS + ('compatible',)}
-            sp.props = [(k, ours.get(k, v)) for k, v in sp.props]
+            pc = {k: v for k, v in c.props if k in PINCTRL_PROPS + ('compatible',)}
+            sp.props = [(k, pc.get(k, v)) for k, v in sp.props]
             names = {k for k, v in sp.props}
-            for k, v in ours.items():
+            for k, v in pc.items():
                 if k not in names: sp.props.append((k, v))
             kn = {x.name for x in sp.kids}
             sp.kids += [copy.deepcopy(x) for x in c.kids if x.name not in kn]
