@@ -3,7 +3,8 @@
  *
  * It replaces the Android first-stage init for bring-up tests: it never reboots, and it prints on the
  * screen (fbcon on /dev/console) what the kernel found: block devices, MMC hosts and the kernel
- * messages that mention storage, pinctrl, regulators, RPM/SMD. The screen is redrawn every 5 s.
+ * messages that mention storage, pinctrl, regulators, RPM/SMD. After a summary page it cycles through the WHOLE kernel log in pages (PAGE i/N), so a phone
+ * video of the screen is enough; no TWRP / pstore needed. It never panics.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -53,20 +54,6 @@ static void regulator_names(void)
 	closedir(d);
 }
 
-static void crash_to_save_log(void)
-{
-	/*
-	 * pmsg gets flooded by TWRP, so the log is saved the way that already works: a deliberate panic.
-	 * pstore keeps the kernel log up to the panic as dmesg-ramoops-0 (the whole boot fits in it).
-	 */
-	printf("\n*** Saving the log: forced panic in 5 s. Then hold Power ~10 s, boot TWRP and copy\n"
-	       "*** /sys/fs/pstore/dmesg-ramoops-0 ***\n");
-	sleep(5);
-	int fd = open("/proc/sysrq-trigger", O_WRONLY);
-	if (fd >= 0) { write(fd, "c", 1); close(fd); }
-	printf("(sysrq crash failed: no /proc/sysrq-trigger)\n");
-}
-
 static int interesting(const char *l)
 {
 	static const char *k[] = { "mmc", "sdhci", "pinctrl", "regulator", "rpm", "smd", "smem",
@@ -77,9 +64,51 @@ static int interesting(const char *l)
 	return 0;
 }
 
+#define LINES_PER_PAGE 82
+#define PAGE_SECS 7
+
+static void summary(char *buf, size_t sz, int round)
+{
+	printf("\033[2J\033[H");
+	printf("A01Q DIAG  SUMMARY  (cycle %d)  uptime: ", round);
+	cat("/proc/uptime", 1);
+	printf("== /proc/partitions ==\n"); cat("/proc/partitions", 14);
+	printf("== /sys/class/mmc_host ==\n"); ls("/sys/class/mmc_host");
+	printf("== /sys/block ==\n"); ls("/sys/block");
+	printf("== regulators ==\n"); regulator_names();
+	printf("== kernel messages (storage/pinctrl/rpm/...) ==\n");
+	int n = klogctl(3, buf, sz - 1);
+	if (n > 0) {
+		static char *lines[8000]; int cnt = 0;
+		buf[n] = 0;
+		for (char *p = strtok(buf, "\n"); p && cnt < 8000; p = strtok(NULL, "\n"))
+			if (interesting(p)) lines[cnt++] = p;
+		for (int i = cnt > 40 ? cnt - 40 : 0; i < cnt; i++) printf("%.88s\n", lines[i]);
+	}
+}
+
+static void log_pages(char *buf, size_t sz)
+{
+	static char *lines[12000];
+	int cnt = 0, n = klogctl(3, buf, sz - 1);
+	if (n <= 0) return;
+	buf[n] = 0;
+	for (char *p = strtok(buf, "\n"); p && cnt < 12000; p = strtok(NULL, "\n"))
+		if (!strstr(p, "+0x")) lines[cnt++] = p; /* skip backtrace lines */
+	int pages = (cnt + LINES_PER_PAGE - 1) / LINES_PER_PAGE;
+	for (int pg = 0; pg < pages; pg++) {
+		printf("\033[2J\033[H");
+		printf("A01Q LOG  PAGE %d/%d  (lines %d-%d of %d)\n", pg + 1, pages,
+		       pg * LINES_PER_PAGE + 1, (pg + 1) * LINES_PER_PAGE < cnt ? (pg + 1) * LINES_PER_PAGE : cnt, cnt);
+		for (int i = pg * LINES_PER_PAGE; i < cnt && i < (pg + 1) * LINES_PER_PAGE; i++)
+			printf("%.88s\n", lines[i]);
+		sleep(PAGE_SECS);
+	}
+}
+
 int main(void)
 {
-	static char buf[1 << 18];
+	static char buf[1 << 19];
 	int round = 0;
 
 	mkdir("/proc", 0555); mkdir("/sys", 0555);
@@ -89,23 +118,9 @@ int main(void)
 	if (freopen("/dev/console", "w", stdout)) setvbuf(stdout, NULL, _IONBF, 0);
 
 	for (;;) {
-		sleep(round ? 5 : 15); /* let the deferred probes finish first */
-		printf("\033[2J\033[H");
-		printf("A01Q DIAG round %d\n", round++);
-		cat("/proc/uptime", 1);
-		printf("== /proc/partitions ==\n"); cat("/proc/partitions", 14);
-		printf("== /sys/class/mmc_host ==\n"); ls("/sys/class/mmc_host");
-		printf("== /sys/block ==\n"); ls("/sys/block");
-		printf("== regulators ==\n"); regulator_names();
-		printf("== kernel messages (storage/pinctrl/rpm/...) ==\n");
-		int n = klogctl(3, buf, sizeof buf - 1);
-		if (n > 0) {
-			char *lines[4000]; int cnt = 0;
-			buf[n] = 0;
-			for (char *p = strtok(buf, "\n"); p && cnt < 4000; p = strtok(NULL, "\n"))
-				if (interesting(p)) lines[cnt++] = p;
-			for (int i = cnt > 45 ? cnt - 45 : 0; i < cnt; i++) printf("%.88s\n", lines[i]);
-		}
-		if (round == 8) crash_to_save_log(); /* about 50 s after boot */
+		sleep(round ? 1 : 15); /* let the deferred probes finish first */
+		summary(buf, sizeof buf, round++);
+		sleep(8);
+		log_pages(buf, sizeof buf);
 	}
 }
