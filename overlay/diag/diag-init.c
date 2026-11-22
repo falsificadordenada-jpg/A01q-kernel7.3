@@ -53,12 +53,18 @@ static void regulator_names(void)
 	closedir(d);
 }
 
-static void save_log_to_pstore(char *buf, size_t len)
+static void crash_to_save_log(void)
 {
-	/* Writes the full kernel log to pmsg: it shows up as pmsg-ramoops-0 in TWRP after a warm reboot. */
-	int n = klogctl(3, buf, len - 1), fd = open("/dev/pmsg0", O_WRONLY);
-	if (fd >= 0 && n > 0) { write(fd, buf, n); close(fd); printf("(full log written to pmsg, %d bytes)\n", n); }
-	else printf("(pmsg write failed)\n");
+	/*
+	 * pmsg gets flooded by TWRP, so the log is saved the way that already works: a deliberate panic.
+	 * pstore keeps the kernel log up to the panic as dmesg-ramoops-0 (the whole boot fits in it).
+	 */
+	printf("\n*** Saving the log: forced panic in 5 s. Then hold Power ~10 s, boot TWRP and copy\n"
+	       "*** /sys/fs/pstore/dmesg-ramoops-0 ***\n");
+	sleep(5);
+	int fd = open("/proc/sysrq-trigger", O_WRONLY);
+	if (fd >= 0) { write(fd, "c", 1); close(fd); }
+	printf("(sysrq crash failed: no /proc/sysrq-trigger)\n");
 }
 
 static int interesting(const char *l)
@@ -100,6 +106,6 @@ int main(void)
 				if (interesting(p)) lines[cnt++] = p;
 			for (int i = cnt > 45 ? cnt - 45 : 0; i < cnt; i++) printf("%.88s\n", lines[i]);
 		}
-		if (round == 3) save_log_to_pstore(buf, sizeof buf);
+		if (round == 8) crash_to_save_log(); /* about 50 s after boot */
 	}
 }
